@@ -4,15 +4,25 @@ import re
 import asyncio
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
 from playwright.async_api import async_playwright
 
 
 # ==========================
 # CONFIG
 # ==========================
-import os
 TOKEN = os.getenv("TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("❌ TOKEN não encontrado no ambiente (Render Environment Variables)")
+
 ARQ_GRUPOS = "grupos.json"
 ARQ_HISTORICO = "historico.json"
 
@@ -39,7 +49,7 @@ historico = carregar_json(ARQ_HISTORICO, [])
 
 
 # ==========================
-# Shopee helpers
+# HELPERS
 # ==========================
 def link_eh_shopee(url: str) -> bool:
     return "shopee.com" in url.lower() or "s.shopee.com.br" in url.lower()
@@ -51,138 +61,104 @@ def transformar_link_afiliado(url: str) -> str:
     return f"{SEU_LINK_AFILIADO_BASE}?{url}"
 
 
-def extrair_numero(valor: str):
+def formatar_preco(valor):
     if not valor:
         return None
-    match = re.search(r"(\d+[.,]\d{2})", valor)
-    if match:
-        return match.group(1).replace(",", ".")
-    return None
+    try:
+        return f"R$ {float(valor):.2f}".replace(".", ",")
+    except:
+        return None
 
 
 # ==========================
-# PLAYWRIGHT (ROBUSTO)
+# PLAYWRIGHT ROBUSTO
 # ==========================
 async def extrair_dados_shopee(url: str):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox"]
+        )
+
         page = await browser.new_page()
 
-        titulo = None
-        preco = None
-        preco_antigo = None
-        desconto = None
-        imagem = None
-        avaliacao = None
-        frete_gratis = False
+        dados = {
+            "titulo": "Oferta Shopee",
+            "preco": None,
+            "preco_antigo": None,
+            "desconto": None,
+            "avaliacao": None,
+            "frete_gratis": False,
+            "imagem": None,
+        }
 
         try:
             await page.goto(url, timeout=60000)
-
-            # espera básica (Shopee é SPA)
             await page.wait_for_timeout(5000)
 
             html = await page.content()
 
-            # =====================
-            # TÍTULO
-            # =====================
+            # Título
             try:
-                titulo = await page.title()
+                dados["titulo"] = await page.title()
             except:
-                titulo = "Oferta Shopee"
+                pass
 
-            # =====================
-            # IMAGEM
-            # =====================
+            # Imagem
             try:
-                imagem = await page.eval_on_selector(
+                dados["imagem"] = await page.eval_on_selector(
                     'meta[property="og:image"]',
                     "el => el.content"
                 )
             except:
-                imagem = None
+                pass
 
-            # =====================
-            # PREÇO (MELHOR MÉTODO)
-            # Shopee guarda em JSON interno
-            # =====================
-            json_match = re.search(r'{"price":(\d+)', html)
+            # PREÇO (JSON interno mais confiável)
+            match = re.search(r'"price":(\d+)', html)
+            if match:
+                dados["preco"] = float(match.group(1)) / 100
 
-            if json_match:
-                preco = float(json_match.group(1)) / 100
-
-            # fallback regex visual
-            if not preco:
-                match = re.search(r"R\$\s?\d+[.,]\d{2}", html)
-                if match:
-                    preco = extrair_numero(match.group(0))
-
-            # =====================
             # PREÇO ANTIGO
-            # =====================
-            old_match = re.search(r'"price_before_discount":(\d+)', html)
-            if old_match:
-                preco_antigo = float(old_match.group(1)) / 100
+            match_old = re.search(r'"price_before_discount":(\d+)', html)
+            if match_old:
+                dados["preco_antigo"] = float(match_old.group(1)) / 100
 
-            # =====================
             # DESCONTO
-            # =====================
-            if preco and preco_antigo:
+            if dados["preco"] and dados["preco_antigo"]:
                 try:
-                    desconto = round(((preco_antigo - preco) / preco_antigo) * 100)
+                    dados["desconto"] = round(
+                        (1 - dados["preco"] / dados["preco_antigo"]) * 100
+                    )
                 except:
-                    desconto = None
+                    pass
 
-            # =====================
             # FRETE GRÁTIS
-            # =====================
             if "frete grátis" in html.lower():
-                frete_gratis = True
+                dados["frete_gratis"] = True
 
-            # =====================
             # AVALIAÇÃO
-            # =====================
             rating = re.search(r'"rating_star":([\d.]+)', html)
             if rating:
-                avaliacao = rating.group(1)
+                dados["avaliacao"] = rating.group(1)
 
         except Exception as e:
             print("Erro Playwright:", e)
 
         await browser.close()
-
-        return {
-            "titulo": titulo,
-            "preco": preco,
-            "preco_antigo": preco_antigo,
-            "desconto": desconto,
-            "avaliacao": avaliacao,
-            "frete_gratis": frete_gratis,
-            "imagem": imagem
-        }
+        return dados
 
 
 # ==========================
-# FORMATADOR
-# ==========================
-def formatar(preco):
-    if not preco:
-        return None
-    return f"R$ {float(preco):.2f}".replace(".", ",")
-
-
-# ==========================
-# RECEBER LINK
+# MENSAGEM
 # ==========================
 async def receber_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto = update.message.text.strip()
+    texto = update.message.text
 
-    link_match = re.search(r"(https?://\S+)", texto)
-    if not link_match:
+    match = re.search(r"(https?://\S+)", texto)
+    if not match:
         return
 
-    link = link_match.group(1)
+    link = match.group(1)
 
     if not link_eh_shopee(link):
         return
@@ -192,7 +168,6 @@ async def receber_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     dados = await extrair_dados_shopee(link)
-
     link_afiliado = transformar_link_afiliado(link)
 
     msg = f"""🔥 OFERTA SHOPEE 🔥
@@ -201,13 +176,13 @@ async def receber_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
 
     if dados["preco"]:
-        msg += f"\n💰 Preço: {formatar(dados['preco'])}"
+        msg += f"\n💰 Preço: {formatar_preco(dados['preco'])}"
 
     if dados["desconto"]:
         msg += f"\n🏷️ Desconto: {dados['desconto']}%"
 
     if dados["frete_gratis"]:
-        msg += f"\n🚚 Frete grátis disponível"
+        msg += f"\n🚚 Frete grátis"
 
     if dados["avaliacao"]:
         msg += f"\n⭐ Avaliação: {dados['avaliacao']}"
@@ -223,21 +198,23 @@ async def receber_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for g in grupos:
         try:
             await context.bot.send_message(chat_id=g["id"], text=msg)
-        except:
-            pass
+        except Exception as e:
+            print("Erro envio:", e)
 
     await update.message.reply_text("✅ Enviado!")
 
 
 # ==========================
-# MAIN
+# START
 # ==========================
 def main():
+    print("🚀 TOKEN carregado:", bool(TOKEN))
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receber_link))
 
-    print("Bot rodando...")
+    print("🤖 Bot rodando...")
     app.run_polling()
 
 
